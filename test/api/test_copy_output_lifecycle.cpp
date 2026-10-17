@@ -653,6 +653,38 @@ TEST_CASE("COPY removes rotated outputs after a later finalization failure", "[a
 	REQUIRE(!fs.DirectoryExists(output));
 }
 
+TEST_CASE("COPY removes the missing parent directories it created after a failure", "[api][copy]") {
+	DuckDB db(nullptr);
+	Connection connection(db);
+	REQUIRE_NO_FAIL(connection.Query("SET threads=1"));
+	REQUIRE_NO_FAIL(connection.Query("SET async_threads=0"));
+	auto &fs = FileSystem::GetFileSystem(*connection.context);
+
+	auto root = TestCreatePath("copy_lifecycle_missing_parents");
+	RemoveDirectoryIfPresent(fs, root);
+	fs.CreateDirectory(root);
+	auto created = fs.JoinPath(root, "a");
+	for (auto &target_options : vector<std::pair<string, string>> {{"b/data.csv", "USE_TMP_FILE false"},
+	                                                               {"b/data.csv", "USE_TMP_FILE true"},
+	                                                               {"b/c", "PARTITION_BY (p)"},
+	                                                               {"b/c", "PER_THREAD_OUTPUT true"},
+	                                                               {"b/c", "FILE_SIZE_BYTES '1kb'"}}) {
+		auto target = fs.JoinPath(created, target_options.first);
+		auto result = connection.Query(StringUtil::Format(
+		    "COPY (SELECT CASE WHEN i = 4096 THEN error('injected failure') ELSE i END AS v, i %% 2 AS p "
+		    "FROM range(8192) t(i)) TO '%s' (FORMAT CSV, %s)",
+		    target, target_options.second));
+		REQUIRE_FAIL(result);
+		// the COPY got past creating its directories and failed while writing
+		REQUIRE(StringUtil::Contains(result->GetError(), "injected failure"));
+		result.reset();
+		// the levels the COPY created are removed, the level that already existed is preserved
+		REQUIRE(!fs.DirectoryExists(created));
+		REQUIRE(fs.DirectoryExists(root));
+	}
+	RemoveDirectoryIfPresent(fs, root);
+}
+
 TEST_CASE("COPY cleans a finalized temporary file when its move fails", "[api][copy]") {
 	for (auto batch_mode : {false, true}) {
 		DuckDB db(nullptr);

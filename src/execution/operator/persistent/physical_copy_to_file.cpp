@@ -497,6 +497,7 @@ public:
 
 private:
 	void PrepareOutputDirectory() DUCKDB_EXCLUDES(lock);
+	bool CreateDirectories(const string &dir_path) DUCKDB_EXCLUDES(lock);
 	void EnsureDirectory(const string &dir_path) DUCKDB_EXCLUDES(lock);
 	void RegisterPendingFileStatePathLocked(PendingFileState &pending_file_state, string output_path)
 	    DUCKDB_REQUIRES(lock);
@@ -3569,15 +3570,38 @@ void CopyToFileGlobalState::PrepareOutputDirectory() {
 		}
 	}
 
-	if (!fs.DirectoryExists(op.file_path)) {
-		if (fs.CreateDirectoryExtended(op.file_path, {CreateDirectoryMode::SINGLE})) {
-			output_lifecycle.RegisterCreatedDirectory(op.file_path);
-		} else {
-			CheckDirectory(fs, op.file_path, op.overwrite_mode);
-		}
-	} else {
+	if (!CreateDirectories(op.file_path)) {
 		CheckDirectory(fs, op.file_path, op.overwrite_mode);
 	}
+}
+
+// Like CreateDirectoryMode::RECURSIVE, but one level at a time, so that every level the COPY creates is removed again
+// if the COPY fails. Returns whether the target itself was created.
+bool CopyToFileGlobalState::CreateDirectories(const string &dir_path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	vector<string> missing_directories;
+	if (!fs.DirectoryExists(dir_path)) {
+		missing_directories.push_back(dir_path);
+		// object stores have no parent directories to create
+		if (!FileSystem::IsRemoteFile(dir_path)) {
+			for (auto parent = Path::FromString(dir_path).Parent(); parent.HasPathSegments();
+			     parent = parent.Parent()) {
+				auto parent_path = parent.ToString();
+				if (fs.DirectoryExists(parent_path)) {
+					break;
+				}
+				missing_directories.push_back(std::move(parent_path));
+			}
+		}
+	}
+	bool created = false;
+	for (auto it = missing_directories.rbegin(); it != missing_directories.rend(); ++it) {
+		created = fs.CreateDirectoryExtended(*it, {CreateDirectoryMode::SINGLE});
+		if (created) {
+			output_lifecycle.RegisterCreatedDirectory(*it);
+		}
+	}
+	return created;
 }
 
 void CopyToFileGlobalState::ScheduleOutputDirectorySetup() {
@@ -3625,8 +3649,17 @@ void CopyToFileGlobalState::RegisterPendingFileStatePathLocked(PendingFileState 
 }
 
 unique_ptr<GlobalFileState> CopyToFileGlobalState::InitializeFileState(PendingFileState pending_file_state) {
-	output_lifecycle.RegisterFile(pending_file_state.output_path);
-	auto data = op.function.copy_to_initialize_global(context, *op.bind_data, pending_file_state.output_path);
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto &output_path = pending_file_state.output_path;
+	// directory-style outputs prepare their directories up front - a single-file COPY creates the file's parents here
+	if (!output_directory_job && !FileSystem::IsRemoteFile(output_path) && !fs.IsPipe(output_path)) {
+		auto parent = Path::FromString(output_path).Parent();
+		if (parent.HasPathSegments()) {
+			CreateDirectories(parent.ToString());
+		}
+	}
+	output_lifecycle.RegisterFile(output_path);
+	auto data = op.function.copy_to_initialize_global(context, *op.bind_data, output_path);
 	if (pending_file_state.written_file_info && pending_file_state.written_file_info->file_stats) {
 		op.function.copy_to_get_written_statistics(context, *op.bind_data, *data,
 		                                           *pending_file_state.written_file_info->file_stats);

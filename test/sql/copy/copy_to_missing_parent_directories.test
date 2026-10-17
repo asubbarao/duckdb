@@ -1,0 +1,59 @@
+# name: test/sql/copy/copy_to_missing_parent_directories.test
+# description: COPY TO creates every missing parent directory of its target
+# group: [copy]
+
+require parquet
+
+require json
+
+foreach format csv parquet json
+
+statement ok
+COPY (SELECT 42 AS i) TO '{TEST_DIR}/missing_parents_{format}/single/a/b/data.{format}' (FORMAT {format});
+
+query I
+SELECT i FROM read_{format}('{TEST_DIR}/missing_parents_{format}/single/a/b/data.{format}');
+----
+42
+
+statement ok
+COPY (SELECT 42 AS i) TO '{TEST_DIR}/missing_parents_{format}/tmp_file/a/b/data.{format}'
+(FORMAT {format}, USE_TMP_FILE true);
+
+query I
+SELECT i FROM read_{format}('{TEST_DIR}/missing_parents_{format}/tmp_file/a/b/data.{format}');
+----
+42
+
+statement ok
+COPY (SELECT i, i % 2 AS p FROM range(4) t(i)) TO '{TEST_DIR}/missing_parents_{format}/partitioned/a/b'
+(FORMAT {format}, PARTITION_BY (p));
+
+query II
+SELECT p, sum(i)
+FROM read_{format}('{TEST_DIR}/missing_parents_{format}/partitioned/a/b/**/*.{format}', hive_partitioning = true)
+GROUP BY p
+ORDER BY p;
+----
+0	2
+1	4
+
+statement ok
+COPY (SELECT i FROM range(4) t(i)) TO '{TEST_DIR}/missing_parents_{format}/per_thread/a/b'
+(FORMAT {format}, PER_THREAD_OUTPUT true);
+
+query I
+SELECT sum(i) FROM read_{format}('{TEST_DIR}/missing_parents_{format}/per_thread/a/b/*.{format}');
+----
+6
+
+statement ok
+COPY (SELECT i FROM range(10000) t(i)) TO '{TEST_DIR}/missing_parents_{format}/file_size_bytes/a/b'
+(FORMAT {format}, FILE_SIZE_BYTES '1kb');
+
+query I
+SELECT sum(i) FROM read_{format}('{TEST_DIR}/missing_parents_{format}/file_size_bytes/a/b/*.{format}');
+----
+49995000
+
+endloop
